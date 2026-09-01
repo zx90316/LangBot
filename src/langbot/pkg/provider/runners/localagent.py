@@ -229,12 +229,25 @@ class LocalAgentRunner(runner.RequestRunner):
         req_messages = query.prompt.messages.copy() + query.messages.copy()
 
         if any(getattr(tool, 'name', None) == EXEC_TOOL_NAME for tool in query.use_funcs or []):
-            req_messages.append(
-                provider_message.Message(
-                    role='system',
-                    content=self.ap.box_service.get_system_guidance(query),
-                )
-            )
+            guidance = self.ap.box_service.get_system_guidance(query)
+            # Some providers (e.g. Ollama's chat API) reject a request outright
+            # if a system message appears anywhere but first ("system message
+            # must be at the beginning"). Merge the sandbox guidance into the
+            # existing leading system message instead of appending a second,
+            # trailing one. Build a new Message rather than mutating the
+            # leading one in place — it may be the same object cached on
+            # query.prompt.messages and shared across turns/queries.
+            if req_messages and req_messages[0].role == 'system':
+                leading = req_messages[0]
+                if isinstance(leading.content, list):
+                    merged_content = [*leading.content, provider_message.ContentElement.from_text(guidance)]
+                elif isinstance(leading.content, str) and leading.content:
+                    merged_content = f'{leading.content}\n\n{guidance}'
+                else:
+                    merged_content = guidance
+                req_messages[0] = leading.model_copy(update={'content': merged_content})
+            else:
+                req_messages.insert(0, provider_message.Message(role='system', content=guidance))
 
         req_messages.append(user_message)
         return req_messages
