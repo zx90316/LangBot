@@ -1,0 +1,9 @@
+{
+  "package": "langbot-plugin",
+  "version": "0.5.6",
+  "description": "Windows local fixes for Plugin installation workers on 0.5.6 (WS launcher routing for debug server).",
+  "files": [
+    "runtime/plugin/mgr.py",
+    "runtime/app.py"
+  ]
+}

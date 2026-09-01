@@ -20,14 +20,14 @@ Box 沙箱在 Windows 本地另有 stdio 問題；本指南 **維持關閉 Box**
 修補檔位於：
 
 ```
-patches/langbot-plugin/0.5.5/
+patches/langbot-plugin/0.5.6/
   MANIFEST.json
   runtime/plugin/mgr.py
   runtime/plugin/worker_launcher.py
   runtime/app.py
 ```
 
-對應 [`pyproject.toml`](../pyproject.toml) 中的 `langbot-plugin==0.5.5`。
+對應 [`pyproject.toml`](../pyproject.toml) 中的 `langbot-plugin==0.5.6`。
 
 **重要：** 每次執行 `uv sync` 後，`.venv` 會還原上游套件，必須重新套用 patch。
 
@@ -83,7 +83,7 @@ Linux / WSL 對等命令：
 uv run --no-sync python scripts/apply-langbot-plugin-patches.py --check
 ```
 
-成功時輸出：`Patch check OK (3 files match langbot-plugin 0.5.5).`
+成功時輸出：`Patch check OK (2 files match langbot-plugin 0.5.6).`
 
 ## Plugin 依賴
 
@@ -119,7 +119,7 @@ uv run --no-sync python scripts/apply-langbot-plugin-patches.py
 
 ### langbot-plugin 版本升級
 
-若 `pyproject.toml` 中 `langbot-plugin` 版本不再是 `0.5.5`：
+若 `pyproject.toml` 中 `langbot-plugin` 版本不再是 `0.5.6`：
 
 1. 在 `patches/langbot-plugin/<新版本>/` 建立對應 patch（或從上游重新移植修復）
 2. 更新該目錄的 `MANIFEST.json`
