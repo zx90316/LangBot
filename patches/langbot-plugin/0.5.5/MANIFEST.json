@@ -1,0 +1,10 @@
+{
+  "package": "langbot-plugin",
+  "version": "0.5.5",
+  "description": "Windows local fixes for Plugin installation workers (stdio/WinError, SystemRoot env, auto dependency install).",
+  "files": [
+    "runtime/plugin/mgr.py",
+    "runtime/plugin/worker_launcher.py",
+    "runtime/app.py"
+  ]
+}
