@@ -206,6 +206,8 @@ _SYNC_PROXY_CAPABILITY: contextvars.ContextVar[_ScopedSessionGuardState | None] 
 _ALLOWED_SCOPED_BUILTIN_FUNCTION_TYPES = {
     'coalesce': sqlalchemy.sql.functions.coalesce,
     'count': sqlalchemy.sql.functions.count,
+    'max': sqlalchemy.sql.functions.max,
+    'min': sqlalchemy.sql.functions.min,
     'now': sqlalchemy.sql.functions.now,
     'sum': sqlalchemy.sql.functions.sum,
 }
