@@ -18,7 +18,16 @@ from ...utils import bounded_executor
 
 from linebot.v3 import WebhookHandler
 from linebot.v3.exceptions import InvalidSignatureError
-from linebot.v3.messaging import Configuration, ApiClient, MessagingApi, ReplyMessageRequest, TextMessage, ImageMessage
+from linebot.v3.messaging import (
+    ApiException,
+    ApiClient,
+    Configuration,
+    ImageMessage,
+    MessagingApi,
+    PushMessageRequest,
+    ReplyMessageRequest,
+    TextMessage,
+)
 from linebot.v3.webhooks import (
     MessageEvent,
     TextMessageContent,
@@ -222,8 +231,39 @@ class LINEAdapter(abstract_platform_adapter.AbstractMessagePlatformAdapter):
             bot_account_id=bot_account_id,
         )
 
+    @staticmethod
+    def _content_to_line_message(content: dict):
+        if content['type'] == 'text':
+            return TextMessage(text=content['content'])
+        elif content['type'] == 'image':
+            # LINE ImageMessage requires original_content_url and preview_image_url
+            image_url = content['image']
+            return ImageMessage(original_content_url=image_url, preview_image_url=image_url)
+        return None
+
+    @staticmethod
+    def _resolve_push_target(message_source: platform_events.MessageEvent) -> str | None:
+        """Resolve the persistent LINE id (user/group) to push to, as a fallback
+        for when the one-shot reply token from the triggering webhook event is
+        no longer usable."""
+        if isinstance(message_source, platform_events.GroupMessage):
+            return message_source.sender.group.id
+        elif isinstance(message_source, platform_events.FriendMessage):
+            return message_source.sender.id
+        return None
+
     async def send_message(self, target_type: str, target_id: str, message: platform_message.MessageChain):
-        pass
+        """Proactively push a message to a LINE user/group, independent of any
+        reply token (e.g. for scheduler/reminder plugins)."""
+        content_list = await self.message_converter.yiri2target(message, self.api_client)
+        line_messages = [msg for msg in (self._content_to_line_message(c) for c in content_list) if msg is not None]
+
+        # LINE caps a single push request at 5 messages.
+        for i in range(0, len(line_messages), 5):
+            await asyncio.to_thread(
+                self.bot.push_message_with_http_info,
+                PushMessageRequest(to=target_id, messages=line_messages[i : i + 5]),
+            )
 
     async def reply_message(
         self,
@@ -232,25 +272,33 @@ class LINEAdapter(abstract_platform_adapter.AbstractMessagePlatformAdapter):
         quote_origin: bool = False,
     ):
         content_list = await self.message_converter.yiri2target(message, self.api_client)
+        reply_token = message_source.source_platform_object.reply_token
 
         for content in content_list:
-            if content['type'] == 'text':
+            line_message = self._content_to_line_message(content)
+            if line_message is None:
+                continue
+
+            try:
                 await asyncio.to_thread(
                     self.bot.reply_message_with_http_info,
-                    ReplyMessageRequest(
-                        reply_token=message_source.source_platform_object.reply_token,
-                        messages=[TextMessage(text=content['content'])],
-                    ),
+                    ReplyMessageRequest(reply_token=reply_token, messages=[line_message]),
                 )
-            elif content['type'] == 'image':
-                # LINE ImageMessage requires original_content_url and preview_image_url
-                image_url = content['image']
+            except ApiException as e:
+                # Reply tokens are single-use and expire ~1 minute after the
+                # webhook event fired. A slow turn (tool calls, a local LLM,
+                # multiple messages replying to the same token) routinely
+                # misses that window. Fall back to the push API, keyed by the
+                # sender/group's persistent id, so the response still arrives.
+                await self.logger.warning(
+                    f'LINE reply_message failed ({e}); falling back to push_message'
+                )
+                target_id = self._resolve_push_target(message_source)
+                if target_id is None:
+                    raise
                 await asyncio.to_thread(
-                    self.bot.reply_message_with_http_info,
-                    ReplyMessageRequest(
-                        reply_token=message_source.source_platform_object.reply_token,
-                        messages=[ImageMessage(original_content_url=image_url, preview_image_url=image_url)],
-                    ),
+                    self.bot.push_message_with_http_info,
+                    PushMessageRequest(to=target_id, messages=[line_message]),
                 )
 
     async def is_muted(self, group_id: int) -> bool:
