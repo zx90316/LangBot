@@ -162,6 +162,29 @@ class BoxRuntimeConnector(ManagedRuntimeConnector):
     def _uses_websocket(self) -> bool:
         return self.uses_websocket()
 
+    async def _connect_transport(self) -> None:
+        """Pick and establish the actual transport.
+
+        Native asyncio stdio pipes are broken on Windows for this kind of
+        subprocess (``WinError 6`` — ``ProactorEventLoop`` cannot register a
+        stdio pipe handle with IOCP), so win32 must ALWAYS avoid
+        ``_start_local_stdio()`` and use the subprocess+WS transport instead
+        — regardless of ``uses_websocket()``, which answers a different
+        question (does Box run with a separate filesystem view) and
+        previously gated this win32 branch, making it unreachable for the
+        common case (no configured endpoint, not in Docker, no
+        ``--standalone-box``). This mirrors the plugin runtime connector's
+        3-way decision (Docker/WS, win32 subprocess+WS, Unix stdio).
+        """
+        if self.configured_runtime_endpoint or platform.get_platform() == 'docker':
+            await self._connect_remote_ws()
+        elif platform.get_platform() == 'win32':
+            await self._start_subprocess_then_ws()
+        elif platform.use_websocket_to_connect_box_runtime():
+            await self._connect_remote_ws()
+        else:
+            await self._start_local_stdio()
+
     async def initialize(self) -> None:
         async with self._lifecycle_lock:
             if self._closing:
@@ -169,13 +192,7 @@ class BoxRuntimeConnector(ManagedRuntimeConnector):
             self._generation += 1
             await self._stop_transport()
             try:
-                if self._uses_websocket():
-                    if platform.get_platform() == 'win32' and not self.configured_runtime_endpoint:
-                        await self._start_subprocess_then_ws()
-                    else:
-                        await self._connect_remote_ws()
-                else:
-                    await self._start_local_stdio()
+                await self._connect_transport()
             except BaseException:
                 await self._stop_transport()
                 await self._close_managed_subprocess()
@@ -191,13 +208,7 @@ class BoxRuntimeConnector(ManagedRuntimeConnector):
             self._generation += 1
             await self._stop_transport()
             try:
-                if self._uses_websocket():
-                    if platform.get_platform() == 'win32' and not self.configured_runtime_endpoint:
-                        await self._start_subprocess_then_ws()
-                    else:
-                        await self._connect_remote_ws()
-                else:
-                    await self._start_local_stdio()
+                await self._connect_transport()
             except BaseException:
                 await self._stop_transport()
                 await self._close_managed_subprocess()
