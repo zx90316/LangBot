@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import copy
+import re
 import typing
 from .. import runner
 from ...telemetry import features as telemetry_features
@@ -158,6 +159,187 @@ class _StreamAccumulator:
 @runner.runner_class('local-agent')
 class LocalAgentRunner(runner.RequestRunner):
     """Local agent request runner"""
+
+    @staticmethod
+    def _needs_mcp_tool_loop_narrowing(model: modelmgr_requester.RuntimeLLMModel) -> bool:
+        """Return whether this model needs the Ollama qwen3.8 tool-loop workaround."""
+        model_name = str(getattr(getattr(model, 'model_entity', None), 'name', '') or '').lower()
+        model_basename = model_name.rsplit('/', 1)[-1]
+        if not model_basename.startswith('qwen3.8'):
+            return False
+
+        provider = getattr(model, 'provider', None)
+        provider_entity = getattr(provider, 'provider_entity', None)
+        requester_name = str(getattr(provider_entity, 'requester', '') or '').lower()
+        requester_cfg = getattr(getattr(provider, 'requester', None), 'requester_cfg', {}) or {}
+        litellm_provider = str(requester_cfg.get('custom_llm_provider') or '').lower()
+        return requester_name == 'ollama-chat' or litellm_provider in {'ollama', 'ollama_chat'}
+
+    @staticmethod
+    def _filter_funcs_to_mcp_sources(
+        funcs: list,
+        catalog: list[dict],
+        source_ids: set[str],
+        *,
+        preserve_non_mcp: bool,
+    ) -> list:
+        all_mcp_names = {item.get('name') for item in catalog if item.get('name')}
+        selected_mcp_names = {
+            item.get('name')
+            for item in catalog
+            if item.get('source_id') in source_ids and item.get('name')
+        }
+        return [
+            func
+            for func in funcs
+            if (preserve_non_mcp and getattr(func, 'name', None) not in all_mcp_names)
+            or getattr(func, 'name', None) in selected_mcp_names
+        ]
+
+    @staticmethod
+    def _message_text(message: provider_message.Message | None) -> str:
+        content = getattr(message, 'content', None)
+        if isinstance(content, str):
+            return content
+        if not isinstance(content, list):
+            return ''
+        return '\n'.join(
+            str(getattr(part, 'text', '') or '')
+            for part in content
+            if getattr(part, 'type', None) == 'text'
+        )
+
+    async def _get_initial_request_funcs(
+        self,
+        query: pipeline_query.Query,
+        model: modelmgr_requester.RuntimeLLMModel,
+        funcs: list,
+    ) -> list:
+        """Route an explicitly named MCP service before sending a large Ollama catalog."""
+        funcs = list(funcs or [])
+        if not funcs or not self._needs_mcp_tool_loop_narrowing(model):
+            return funcs
+
+        user_text = self._message_text(getattr(query, 'user_message', None)).casefold()
+        if not user_text:
+            return funcs
+
+        mcp_loader = getattr(getattr(self.ap, 'tool_mgr', None), 'mcp_tool_loader', None)
+        if mcp_loader is None:
+            return funcs
+
+        execution_context = get_query_execution_context(query)
+        variables = getattr(query, 'variables', {}) or {}
+        bound_mcp_servers = variables.get('_pipeline_bound_mcp_servers')
+        catalog = await mcp_loader.get_tool_catalog(
+            execution_context,
+            bound_mcp_servers,
+            include_resource_tools=True,
+        )
+
+        source_names: dict[str, str] = {}
+        for item in catalog:
+            source_id = item.get('source_id')
+            source_name = item.get('source_name')
+            if source_id and source_name:
+                source_names.setdefault(source_id, str(source_name).casefold())
+
+        ignored_tokens = {'mcp', 'server', 'workspace', 'tools'}
+        selected_source_ids = {
+            source_id
+            for source_id, source_name in source_names.items()
+            if any(
+                token not in ignored_tokens and len(token) >= 4 and token in user_text
+                for token in re.findall(r'[a-z0-9]+', source_name)
+            )
+        }
+        if not selected_source_ids:
+            return funcs
+
+        narrowed_funcs = self._filter_funcs_to_mcp_sources(
+            funcs,
+            catalog,
+            selected_source_ids,
+            preserve_non_mcp=False,
+        )
+        if len(narrowed_funcs) < len(funcs):
+            selected_names = [source_names[source_id] for source_id in sorted(selected_source_ids)]
+            self.ap.logger.info(
+                'Routed Ollama qwen3.8 initial MCP schemas from '
+                f'{len(funcs)} to {len(narrowed_funcs)} for {selected_names} '
+                f'(query_id={query.query_id})'
+            )
+        return narrowed_funcs
+
+    async def _get_tool_loop_funcs(
+        self,
+        query: pipeline_query.Query,
+        model: modelmgr_requester.RuntimeLLMModel,
+        tool_calls: list[provider_message.ToolCall],
+    ) -> list:
+        """Limit qwen3.8/Ollama continuation schemas to MCP servers already selected.
+
+        Ollama currently may discard the latest user message when a multi-step
+        tool transcript overflows its context window. Large, unrelated MCP
+        catalogs make that much more likely. When the user explicitly names an
+        MCP service, the first turn is routed to it; continuation turns keep the
+        tools from every MCP server selected in the preceding turn.
+        """
+        funcs = list(query.use_funcs or [])
+        if not funcs or not self._needs_mcp_tool_loop_narrowing(model):
+            return funcs
+
+        mcp_loader = getattr(getattr(self.ap, 'tool_mgr', None), 'mcp_tool_loader', None)
+        if mcp_loader is None:
+            return funcs
+
+        called_names = {
+            call.function.name
+            for call in tool_calls
+            if getattr(call, 'function', None) is not None and call.function.name
+        }
+        if not called_names:
+            return funcs
+
+        execution_context = get_query_execution_context(query)
+        variables = getattr(query, 'variables', {}) or {}
+        bound_mcp_servers = variables.get('_pipeline_bound_mcp_servers')
+        catalog = await mcp_loader.get_tool_catalog(
+            execution_context,
+            bound_mcp_servers,
+            include_resource_tools=True,
+        )
+
+        # Catalog order matches MCP invocation resolution. Preserve that order
+        # when duplicate tool names exist across servers.
+        source_by_name: dict[str, str] = {}
+        for item in catalog:
+            name = item.get('name')
+            source_id = item.get('source_id')
+            if name and source_id:
+                source_by_name.setdefault(name, source_id)
+
+        selected_source_ids = {
+            source_by_name[name]
+            for name in called_names
+            if name in source_by_name
+        }
+        if not selected_source_ids:
+            return funcs
+
+        narrowed_funcs = self._filter_funcs_to_mcp_sources(
+            funcs,
+            catalog,
+            selected_source_ids,
+            preserve_non_mcp=False,
+        )
+        if len(narrowed_funcs) < len(funcs):
+            self.ap.logger.info(
+                'Narrowed Ollama qwen3.8 tool-loop schemas from '
+                f'{len(funcs)} to {len(narrowed_funcs)} after MCP selection '
+                f'(query_id={query.query_id})'
+            )
+        return narrowed_funcs
 
     async def _inject_inbound_attachments(
         self,
@@ -317,11 +499,12 @@ class LocalAgentRunner(runner.RequestRunner):
         last_error = None
         for model in candidates:
             try:
+                model_funcs = await self._get_initial_request_funcs(query, model, funcs)
                 msg = await model.provider.invoke_llm(
                     query,
                     model,
                     messages,
-                    funcs if _model_has_ability(model, 'func_call') else [],
+                    model_funcs if _model_has_ability(model, 'func_call') else [],
                     extra_args=model.model_entity.extra_args,
                     remove_think=remove_think,
                 )
@@ -347,11 +530,12 @@ class LocalAgentRunner(runner.RequestRunner):
         last_error = None
         for model in candidates:
             try:
+                model_funcs = await self._get_initial_request_funcs(query, model, funcs)
                 stream = model.provider.invoke_llm_stream(
                     query,
                     model,
                     messages,
-                    funcs if _model_has_ability(model, 'func_call') else [],
+                    model_funcs if _model_has_ability(model, 'func_call') else [],
                     extra_args=model.model_entity.extra_args,
                     remove_think=remove_think,
                 )
@@ -607,6 +791,7 @@ class LocalAgentRunner(runner.RequestRunner):
         tool_call_round = 0
         while pending_tool_calls:
             tool_call_round += 1
+            round_tool_calls = pending_tool_calls
             telemetry_features.set_value(query, 'tool_call_rounds', tool_call_round)
             if tool_call_round > MAX_TOOL_CALL_ROUNDS:
                 self.ap.logger.warning(
@@ -674,6 +859,12 @@ class LocalAgentRunner(runner.RequestRunner):
                 f'use_llm_model={use_llm_model.model_entity.name}'
             )
 
+            tool_loop_funcs = await self._get_tool_loop_funcs(
+                query,
+                use_llm_model,
+                round_tool_calls,
+            )
+
             if is_stream:
                 # Do NOT re-seed the accumulator with first_content:
                 # the previous round's text was already pushed to the
@@ -689,7 +880,7 @@ class LocalAgentRunner(runner.RequestRunner):
                     query,
                     use_llm_model,
                     req_messages,
-                    query.use_funcs if _model_has_ability(use_llm_model, 'func_call') else [],
+                    tool_loop_funcs if _model_has_ability(use_llm_model, 'func_call') else [],
                     extra_args=use_llm_model.model_entity.extra_args,
                     remove_think=remove_think,
                 )
@@ -705,7 +896,7 @@ class LocalAgentRunner(runner.RequestRunner):
                     query,
                     use_llm_model,
                     req_messages,
-                    query.use_funcs if _model_has_ability(use_llm_model, 'func_call') else [],
+                    tool_loop_funcs if _model_has_ability(use_llm_model, 'func_call') else [],
                     extra_args=use_llm_model.model_entity.extra_args,
                     remove_think=remove_think,
                 )

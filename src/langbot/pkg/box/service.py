@@ -275,10 +275,21 @@ class BoxService:
                         await self._purge_attachment_dirs()
                     self._available = True
                     self._connector_error = ''
-                    skill_mgr = getattr(self.ap, 'skill_mgr', None)
-                    reload_skills = getattr(skill_mgr, 'reload_skills', None)
-                    if callable(reload_skills) and not self._cloud_managed:
-                        await reload_skills()
+                    if not self._cloud_managed:
+                        skill_mgr = getattr(self.ap, 'skill_mgr', None)
+                        initialize_skills = getattr(skill_mgr, 'initialize', None)
+                        if callable(initialize_skills):
+                            try:
+                                # SkillManager resolves the singleton OSS Workspace
+                                # binding and reloads the placement-scoped cache.
+                                await initialize_skills()
+                            except Exception as exc:
+                                # The Box transport is already healthy. A best-effort
+                                # cache refresh must not restart the runtime and tear
+                                # down every Box-backed stdio MCP process.
+                                self.ap.logger.warning(
+                                    f'Box runtime reconnected, but skill cache refresh failed: {exc}'
+                                )
                     self.ap.logger.info('Box runtime reconnected, sandbox features restored.')
                     return
                 except Exception as exc:
@@ -2060,7 +2071,10 @@ class BoxService:
             'and code execution instead of estimating mentally. If the user provides numbers, tables, CSV-like text, '
             'JSON, or other data and asks for a computed answer, prefer running a short Python script via exec '
             'and then answer from the tool result. Unless the user explicitly asks for the script, code, or implementation '
-            'details, do not include the generated script in the final answer; return the result and a brief explanation only.'
+            'details, do not include the generated script in the final answer; return the result and a brief explanation only. '
+            'The exec environment has no outbound internet access. Do not use exec, curl, wget, or Python HTTP libraries '
+            'for web searches or live data; use an available dedicated search or API tool instead. DNS failures from exec '
+            'reflect the sandbox network policy and must not be reported as a host or infrastructure outage.'
         )
         if self.default_workspace:
             guidance += (

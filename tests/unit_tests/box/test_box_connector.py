@@ -398,3 +398,68 @@ async def test_websocket_controller_receives_control_headers(monkeypatch: pytest
         BOX_INSTANCE_HEADER: 'instance-a',
     }
     assert _CONTROL_TOKEN not in captured['ws_url']
+
+
+@pytest.mark.asyncio
+async def test_windows_box_runtime_waits_for_listener_and_reuses_live_process(
+    monkeypatch: pytest.MonkeyPatch,
+):
+    monkeypatch.setattr('langbot.pkg.utils.platform.get_platform', lambda: 'win32')
+    monkeypatch.setenv(BOX_CONTROL_TOKEN_ENV, _CONTROL_TOKEN)
+    process = SimpleNamespace(returncode=None, wait=AsyncMock(return_value=0))
+    create_subprocess = AsyncMock(return_value=process)
+    monkeypatch.setattr(asyncio, 'create_subprocess_exec', create_subprocess)
+
+    connector = BoxRuntimeConnector(make_app(Mock()))
+    events = []
+    connector._wait_for_local_ws_listener = AsyncMock(side_effect=lambda: events.append('ready'))
+    connector._connect_ws = AsyncMock(side_effect=lambda *_args: events.append('connect'))
+
+    await connector._start_subprocess_then_ws()
+    await connector._start_subprocess_then_ws()
+
+    create_subprocess.assert_awaited_once()
+    assert connector._wait_for_local_ws_listener.await_count == 2
+    assert connector._connect_ws.await_count == 2
+    assert events == ['ready', 'connect', 'ready', 'connect']
+    env_overrides = create_subprocess.await_args.kwargs['env']
+    assert env_overrides[BOX_CONTROL_TOKEN_ENV] == _CONTROL_TOKEN
+    assert env_overrides[BOX_TRUSTED_INSTANCE_ENV] == 'instance-a'
+
+    process.returncode = 0
+    await connector._close_managed_subprocess()
+
+
+@pytest.mark.asyncio
+async def test_windows_box_runtime_listener_probe_closes_connection(monkeypatch: pytest.MonkeyPatch):
+    connector = BoxRuntimeConnector(make_app(Mock()))
+    writer = SimpleNamespace(close=Mock(), wait_closed=AsyncMock())
+    open_connection = AsyncMock(return_value=(object(), writer))
+    monkeypatch.setattr(asyncio, 'open_connection', open_connection)
+
+    async def run_readiness_check(check, **kwargs):
+        assert kwargs == {'retries': 120, 'interval': 0.25, 'runtime_name': 'box runtime'}
+        await check()
+
+    connector._wait_until_ready = AsyncMock(side_effect=run_readiness_check)
+
+    await connector._wait_for_local_ws_listener()
+
+    open_connection.assert_awaited_once_with('127.0.0.1', connector._relay_port)
+    writer.close.assert_called_once_with()
+    writer.wait_closed.assert_awaited_once_with()
+
+
+@pytest.mark.asyncio
+async def test_windows_box_runtime_listener_probe_fails_fast_when_process_exits(
+    monkeypatch: pytest.MonkeyPatch,
+):
+    connector = BoxRuntimeConnector(make_app(Mock()))
+    connector.runtime_subprocess = SimpleNamespace(returncode=17)
+    open_connection = AsyncMock()
+    monkeypatch.setattr(asyncio, 'open_connection', open_connection)
+
+    with pytest.raises(RuntimeError, match='local box runtime exited before becoming ready'):
+        await connector._wait_for_local_ws_listener()
+
+    open_connection.assert_not_awaited()

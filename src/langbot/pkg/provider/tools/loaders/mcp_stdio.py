@@ -94,6 +94,7 @@ class MCPServerBoxConfig(pydantic.BaseModel):
 
 
 _HANDSHAKE_ATTEMPT_TIMEOUT_SEC = 10.0
+_MAX_RELAY_JSON_LINE_BYTES = 16 * 1024 * 1024
 
 
 @asynccontextmanager
@@ -125,13 +126,46 @@ async def authenticated_websocket_client(url: str, headers: dict[str, str]):
     ) as websocket:
 
         async def ws_reader():
+            # The Box relay forwards stdout chunks, not JSON-RPC message
+            # boundaries. A large response (notably Notion's tools/list) is
+            # therefore split across several WebSocket text frames, while a
+            # small burst can place several newline-delimited messages in one
+            # frame. Reassemble the stdio JSON-lines stream before handing
+            # messages to the MCP client.
+            pending = bytearray()
+
+            async def emit_json_line(raw_line: bytes) -> None:
+                if not raw_line.strip():
+                    return
+                try:
+                    message = mcp_types.JSONRPCMessage.model_validate_json(raw_line)
+                    await read_stream_writer.send(SessionMessage(message))
+                except ValidationError as exc:  # pragma: no cover - upstream parity
+                    await read_stream_writer.send(exc)
+
             async with read_stream_writer:
                 async for raw_text in websocket:
-                    try:
-                        message = mcp_types.JSONRPCMessage.model_validate_json(raw_text)
-                        await read_stream_writer.send(SessionMessage(message))
-                    except ValidationError as exc:  # pragma: no cover - upstream parity
-                        await read_stream_writer.send(exc)
+                    raw_bytes = raw_text.encode('utf-8') if isinstance(raw_text, str) else bytes(raw_text)
+                    pending.extend(raw_bytes)
+
+                    newline_index = pending.find(b'\n')
+                    while newline_index >= 0:
+                        raw_line = bytes(pending[:newline_index])
+                        del pending[: newline_index + 1]
+                        await emit_json_line(raw_line)
+                        newline_index = pending.find(b'\n')
+
+                    if len(pending) > _MAX_RELAY_JSON_LINE_BYTES:
+                        raise ValueError(
+                            f'Box managed-process JSON-RPC message exceeds '
+                            f'{_MAX_RELAY_JSON_LINE_BYTES} bytes'
+                        )
+
+                # Accept a final JSON value without a trailing newline. MCP
+                # stdio normally emits JSONL, but flushing the final buffered
+                # value makes the relay tolerant of otherwise valid servers.
+                if pending:
+                    await emit_json_line(bytes(pending))
 
         async def ws_writer():
             async with write_stream_reader:

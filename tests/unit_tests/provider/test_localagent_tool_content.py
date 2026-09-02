@@ -11,7 +11,7 @@ from __future__ import annotations
 
 import json
 from types import SimpleNamespace
-from unittest.mock import AsyncMock, Mock
+from unittest.mock import ANY, AsyncMock, Mock
 
 import pytest
 
@@ -206,3 +206,133 @@ async def test_tool_message_content_is_string_in_stream():
     )
     assert 'Swift - Wikipedia' in tool_msgs[0].content
     assert 'Swift Programming Language' in tool_msgs[0].content
+
+
+def _runtime_model(name: str, requester_name: str, litellm_provider: str = '') -> SimpleNamespace:
+    return SimpleNamespace(
+        model_entity=SimpleNamespace(name=name),
+        provider=SimpleNamespace(
+            provider_entity=SimpleNamespace(requester=requester_name),
+            requester=SimpleNamespace(requester_cfg={'custom_llm_provider': litellm_provider}),
+        ),
+    )
+
+
+def _tool_call(name: str) -> provider_message.ToolCall:
+    return provider_message.ToolCall(
+        id=f'call-{name}',
+        type='function',
+        function=provider_message.FunctionCall(name=name, arguments='{}'),
+    )
+
+
+@pytest.mark.asyncio
+async def test_qwen38_ollama_tool_loop_keeps_only_selected_mcp_server_tools():
+    catalog = [
+        {'name': 'API-post-search', 'source_id': 'notion-server'},
+        {'name': 'API-post-page', 'source_id': 'notion-server'},
+        {'name': 'gmail_search', 'source_id': 'google-server'},
+        {'name': 'calendar_create', 'source_id': 'google-server'},
+    ]
+    mcp_loader = SimpleNamespace(get_tool_catalog=AsyncMock(return_value=catalog))
+    app = SimpleNamespace(
+        logger=Mock(),
+        tool_mgr=SimpleNamespace(mcp_tool_loader=mcp_loader),
+    )
+    runner = LocalAgentRunner(app, pipeline_config={})
+    query = _make_query()
+    query.use_funcs = [
+        SimpleNamespace(name='sandbox_exec'),
+        SimpleNamespace(name='API-post-search'),
+        SimpleNamespace(name='API-post-page'),
+        SimpleNamespace(name='gmail_search'),
+        SimpleNamespace(name='calendar_create'),
+    ]
+    query.variables['_pipeline_bound_mcp_servers'] = ['notion-server', 'google-server']
+
+    narrowed = await runner._get_tool_loop_funcs(
+        query,
+        _runtime_model('qwen3.8:latest', 'ollama-chat', 'ollama_chat'),
+        [_tool_call('API-post-search')],
+    )
+
+    assert [tool.name for tool in narrowed] == [
+        'API-post-search',
+        'API-post-page',
+    ]
+    mcp_loader.get_tool_catalog.assert_awaited_once_with(
+        ANY,
+        ['notion-server', 'google-server'],
+        include_resource_tools=True,
+    )
+
+
+@pytest.mark.asyncio
+async def test_qwen38_ollama_initial_request_routes_explicit_mcp_service_name():
+    catalog = [
+        {
+            'name': 'API-post-search',
+            'source_id': 'notion-server',
+            'source_name': 'notionhq/notion',
+        },
+        {
+            'name': 'API-post-page',
+            'source_id': 'notion-server',
+            'source_name': 'notionhq/notion',
+        },
+        {
+            'name': 'search_gmail_messages',
+            'source_id': 'google-server',
+            'source_name': 'googleworkspace/workspace',
+        },
+    ]
+    mcp_loader = SimpleNamespace(get_tool_catalog=AsyncMock(return_value=catalog))
+    app = SimpleNamespace(
+        logger=Mock(),
+        tool_mgr=SimpleNamespace(mcp_tool_loader=mcp_loader),
+    )
+    runner = LocalAgentRunner(app, pipeline_config={})
+    query = _make_query()
+    query.user_message = provider_message.Message(
+        role='user',
+        content='你可以操作 Notion 嗎？新增代辦事項我看看',
+    )
+    query.use_funcs = [
+        SimpleNamespace(name='sandbox_exec'),
+        SimpleNamespace(name='API-post-search'),
+        SimpleNamespace(name='API-post-page'),
+        SimpleNamespace(name='search_gmail_messages'),
+    ]
+
+    narrowed = await runner._get_initial_request_funcs(
+        query,
+        _runtime_model('qwen3.8:latest', 'ollama-chat', 'ollama_chat'),
+        query.use_funcs,
+    )
+
+    assert [tool.name for tool in narrowed] == [
+        'API-post-search',
+        'API-post-page',
+    ]
+
+
+@pytest.mark.asyncio
+async def test_non_ollama_model_keeps_full_tool_catalog_for_continuation():
+    mcp_loader = SimpleNamespace(get_tool_catalog=AsyncMock())
+    app = SimpleNamespace(
+        logger=Mock(),
+        tool_mgr=SimpleNamespace(mcp_tool_loader=mcp_loader),
+    )
+    runner = LocalAgentRunner(app, pipeline_config={})
+    query = _make_query()
+    original = [SimpleNamespace(name='API-post-search'), SimpleNamespace(name='gmail_search')]
+    query.use_funcs = original
+
+    result = await runner._get_tool_loop_funcs(
+        query,
+        _runtime_model('qwen3.8:latest', 'openai-chat-completions'),
+        [_tool_call('API-post-search')],
+    )
+
+    assert result == original
+    mcp_loader.get_tool_catalog.assert_not_awaited()

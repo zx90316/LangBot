@@ -288,28 +288,45 @@ class BoxRuntimeConnector(ManagedRuntimeConnector):
         self.ap.logger.info('(windows) Use cmd to launch box runtime and communicate via ws')
 
         self._ensure_control_token(allow_generate=True)
-        env = os.environ.copy()
-        env[BOX_CONTROL_TOKEN_ENV] = self._control_token
-        env[BOX_TRUSTED_INSTANCE_ENV] = self._trusted_instance_uuid
+        env_overrides = {
+            BOX_CONTROL_TOKEN_ENV: self._control_token,
+            BOX_TRUSTED_INSTANCE_ENV: self._trusted_instance_uuid,
+        }
         if self._filtered_box_config:
-            env['LANGBOT_BOX_CONFIG'] = json.dumps(self._filtered_box_config)
+            env_overrides['LANGBOT_BOX_CONFIG'] = json.dumps(self._filtered_box_config)
 
-        python_path = sys.executable
         # Launched through the same CLI entry point as the plugin runtime
         # (cli.__init__ <subcommand>); no flag => WebSocket transport.
-        self.runtime_subprocess = await asyncio.create_subprocess_exec(
-            python_path,
+        # ManagedRuntimeConnector reuses a live process during reconnects instead
+        # of spawning a second Box server that will collide on the relay port.
+        await self._start_runtime_subprocess(
             '-m',
             'langbot_plugin.cli.__init__',
             'box',
             '--ws-control-port',
             str(self._relay_port),
-            env=env,
+            env_overrides=env_overrides,
         )
-        self.runtime_subprocess_task = asyncio.create_task(self.runtime_subprocess.wait())
+        await self._wait_for_local_ws_listener()
 
         ws_url = f'ws://localhost:{self._relay_port}/rpc/ws'
         await self._connect_ws(ws_url, '(windows) WebSocket')
+
+    async def _wait_for_local_ws_listener(self) -> None:
+        """Wait until the managed Windows Box process has bound its relay port."""
+
+        async def check_listener() -> None:
+            reader, writer = await asyncio.open_connection('127.0.0.1', self._relay_port)
+            del reader
+            writer.close()
+            await writer.wait_closed()
+
+        await self._wait_until_ready(
+            check_listener,
+            retries=120,
+            interval=0.25,
+            runtime_name='box runtime',
+        )
 
     async def _connect_remote_ws(self) -> None:
         """Connect to a remote (or Docker) box server via WebSocket."""

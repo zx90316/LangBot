@@ -6,7 +6,7 @@ import os
 import pathlib
 import tempfile
 from types import SimpleNamespace
-from unittest.mock import AsyncMock, Mock
+from unittest.mock import AsyncMock, Mock, create_autospec
 
 import pytest
 
@@ -41,6 +41,7 @@ from langbot_plugin.box.security import (
 from langbot_plugin.entities.io.context import ActionContext
 from langbot.pkg.api.http.context import ExecutionContext
 from langbot.pkg.box.service import BoxService
+from langbot.pkg.skill.manager import SkillManager
 
 _UTC = dt.timezone.utc
 _CONTEXT = ExecutionContext(
@@ -552,7 +553,7 @@ async def test_box_service_reconnect_restores_workspace_and_runs_cleanup(
     monkeypatch: pytest.MonkeyPatch,
 ):
     app = make_app(Mock())
-    app.skill_mgr = SimpleNamespace(reload_skills=AsyncMock())
+    app.skill_mgr = create_autospec(SkillManager, instance=True)
     service = BoxService(app, client=Mock(spec=BoxRuntimeClient))
     connector = Mock()
     connector.reconnect = AsyncMock()
@@ -565,16 +566,43 @@ async def test_box_service_reconnect_restores_workspace_and_runs_cleanup(
     connector.reconnect.assert_awaited_once()
     service._ensure_default_workspace.assert_called_once()
     service._purge_attachment_dirs.assert_awaited_once()
-    app.skill_mgr.reload_skills.assert_awaited_once()
+    app.skill_mgr.initialize.assert_awaited_once_with()
     assert service.available is True
+    assert service._connector_error == ''
 
 
 @pytest.mark.asyncio
-async def test_cloud_box_service_reconnect_does_not_reload_unscoped_skills(
+async def test_box_service_reconnect_survives_skill_cache_refresh_failure(
     monkeypatch: pytest.MonkeyPatch,
 ):
     app = make_app(Mock())
-    app.skill_mgr = SimpleNamespace(reload_skills=AsyncMock())
+    app.skill_mgr = create_autospec(SkillManager, instance=True)
+    app.skill_mgr.initialize.side_effect = RuntimeError('skill refresh failed')
+    service = BoxService(app, client=Mock(spec=BoxRuntimeClient))
+    connector = Mock()
+    connector.reconnect = AsyncMock()
+    service._ensure_default_workspace = Mock()
+    service._purge_attachment_dirs = AsyncMock()
+    monkeypatch.setattr('langbot.pkg.box.service.asyncio.sleep', AsyncMock())
+
+    await service._reconnect_loop(connector)
+
+    connector.reconnect.assert_awaited_once()
+    app.skill_mgr.initialize.assert_awaited_once_with()
+    assert service.available is True
+    assert service._connector_error == ''
+    assert any(
+        'skill cache refresh failed' in str(call.args[0])
+        for call in app.logger.warning.call_args_list
+    )
+
+
+@pytest.mark.asyncio
+async def test_cloud_box_service_reconnect_does_not_initialize_unscoped_skills(
+    monkeypatch: pytest.MonkeyPatch,
+):
+    app = make_app(Mock())
+    app.skill_mgr = create_autospec(SkillManager, instance=True)
     service = BoxService(app, client=Mock(spec=BoxRuntimeClient))
     service._cloud_managed = True
     connector = Mock()
@@ -587,7 +615,7 @@ async def test_cloud_box_service_reconnect_does_not_reload_unscoped_skills(
 
     connector.reconnect.assert_awaited_once()
     service._verify_cloud_runtime.assert_awaited_once()
-    app.skill_mgr.reload_skills.assert_not_awaited()
+    app.skill_mgr.initialize.assert_not_awaited()
     assert service.available is True
 
 
@@ -889,6 +917,8 @@ class TestGetSystemGuidance:
         assert service.OUTBOX_MOUNT_DIR not in guidance
         # core exec guidance is still present
         assert 'exec tool' in guidance
+        assert 'no outbound internet access' in guidance
+        assert 'must not be reported as a host or infrastructure outage' in guidance
 
     def test_guidance_outbox_independent_of_inbound_attachments(self):
         # A bare query_id (the pure-generation case) still gets the outbox note.
